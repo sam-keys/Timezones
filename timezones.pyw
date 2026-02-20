@@ -4,9 +4,13 @@ import os
 from datetime import datetime
 import pytz
 from timezonefinder import TimezoneFinder
-import folium
+#import folium  # Removed b/c map was bugged.
+import tempfile
 
-from PyQt6.QtCore import QTime, Qt, QUrl, pyqtSignal, QObject, pyqtSlot
+from urllib.parse import urlparse, parse_qs
+
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtCore import Qt, QTime, QUrl, pyqtSignal, QObject, pyqtSlot
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -15,6 +19,22 @@ from PyQt6.QtWidgets import (
     QHeaderView, QCheckBox, QFormLayout, QDialogButtonBox
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+# Updated map implementation - no QtLocation in regular distribution
+#from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, pyqtSlot, QPointF
+#from PyQt6.QtGui import QGuiApplication
+#from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox
+#from PyQt6.QtPositioning import QGeoCoordinate
+#from PyQt6.QtLocation import QGeoServiceProvider, QQuickView
+#from PyQt6.QtQuickWidgets import QQuickWidget
+
+
+import os
+import tempfile
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QUrl
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox
+from PyQt6.QtQuickWidgets import QQuickWidget
+from timezonefinder import TimezoneFinder
 
 # ----------------- Data & Helpers -----------------
 
@@ -106,106 +126,175 @@ def parse_time_string(time_str, use_24h):
 
 # ----------------- Map Dialog -----------------
 
-class MapDialog(QDialog):
+class QmlMapDialog(QDialog):
     locationSelected = pyqtSignal(float, float, str)  # lat, lon, timezone
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Location on Map")
-        self.resize(800, 600)
-
-        layout = QVBoxLayout(self)
-        self.webview = QWebEngineView(self)
-        layout.addWidget(self.webview)
+        self.setWindowTitle("Select Location on World Map (QML)")
+        self.resize(900, 500)
 
         self.tf = TimezoneFinder()
+        self._qml_file = None
 
-        # Generate map HTML with click handler
-        self._load_map()
+        main_layout = QVBoxLayout(self)
 
-    def _load_map(self):
-        # Center map roughly on Europe/Africa
-        m = folium.Map(location=[20, 0], zoom_start=2)
+        # QML view
+        self.quick_widget = QQuickWidget(self)
+        self.quick_widget.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        main_layout.addWidget(self.quick_widget)
 
-        # Add JS to handle clicks
-        click_js = """
-            function onMapClick(e) {
-                var lat = e.latlng.lat;
-                var lng = e.latlng.lng;
-                // Send coordinates back via Qt bridge
-                if (window.pyObj) {
-                    window.pyObj.handleMapClick(lat, lng);
-                } else {
-                    alert("pyObj not available");
-                }
-            }
-            map.on('click', onMapClick);
-        """
+        # Bottom buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.cancel_btn = QPushButton("Cancel")
+        self.use_btn = QPushButton("Use Selected Location")
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.use_btn)
+        main_layout.addLayout(btn_layout)
 
-        m.get_root().script.add_child(folium.Element("""
-            <script>
-            var map = null;
-            </script>
-        """))
+        self.cancel_btn.clicked.connect(self.reject)
+        self.use_btn.clicked.connect(self._on_use_location)
 
-        # We need to ensure 'map' variable is the folium map instance.
-        # Folium already creates 'map_xxx' variable; we can hook after creation.
-        # Easiest: add a script that assigns the last created map to 'map'.
-        m.get_root().script.add_child(folium.Element("""
-            <script>
-            setTimeout(function() {
-                for (var key in window) {
-                    if (key.startsWith("map_")) {
-                        window.map = window[key];
-                    }
-                }
-            }, 500);
-            </script>
-        """))
+        # Load QML
+        if not self._load_qml():
+            # If QML failed (e.g., missing image), disable dialog
+            self._valid = False
+        else:
+            self._valid = True
 
-        m.get_root().script.add_child(folium.Element(f"""
-            <script>
-            {click_js}
-            </script>
-        """))
+    def is_valid(self):
+        return self._valid
 
-        data = m.get_root().render().encode("utf-8")
-        html = data.decode("utf-8")
+    def _load_qml(self):
+        img_path = os.path.join(os.path.dirname(__file__), "world_map.png")
+        if not os.path.exists(img_path):
+            QMessageBox.critical(
+                self, "Map Image Missing",
+                f"world_map.png not found in {os.path.dirname(__file__)}.\n"
+                "Please add an equirectangular world map image named 'world_map.png'."
+            )
+            return False
 
-        # Load HTML into webview
-        self.webview.setHtml(html)
+        # QML code: shows the image and tracks last clicked position in image coordinates
+        qml = f"""
+import QtQuick 2.15
+import QtQuick.Controls 2.15
 
-        # Expose Python object to JS
-        self.webview.page().setWebChannel(None)  # ensure clean
-        # Use a simple bridge via runJavaScript injection
-        # We'll inject a small JS object that calls back via QWebEngineView's runJavaScript.
-        # But QWebEngine doesn't support direct Python callbacks from JS without QWebChannel.
-        # So we use QWebChannel properly:
+Item {{
+    id: root
+    width: 900
+    height: 500
 
-        from PyQt6.QtWebChannel import QWebChannel
+    // Last clicked position in image coordinates
+    property real lastX: -1
+    property real lastY: -1
+    property real imgWidth: 1
+    property real imgHeight: 1
 
-        self.channel = QWebChannel(self.webview.page())
-        self.bridge = MapBridge(self)
-        self.channel.registerObject("pyObj", self.bridge)
-        self.webview.page().setWebChannel(self.channel)
+    Image {{
+        id: worldImage
+        anchors.fill: parent
+        fillMode: Image.PreserveAspectFit
+        source: "file:///{img_path.replace("\\", "/")}"
 
-        # Inject webchannel script
-        self.webview.page().runJavaScript("""
-            new QWebChannel(qt.webChannelTransport, function(channel) {
-                window.pyObj = channel.objects.pyObj;
-            });
-        """)
+        onStatusChanged: {{
+            if (status === Image.Ready) {{
+                root.imgWidth = sourceSize.width
+                root.imgHeight = sourceSize.height
+            }}
+        }}
 
-    def handle_coordinates(self, lat, lon):
+        MouseArea {{
+            anchors.fill: parent
+            onClicked: function(mouse) {{
+                // Map from displayed coordinates back to image coordinates
+                var imgW = worldImage.sourceSize.width
+                var imgH = worldImage.sourceSize.height
+                if (imgW <= 0 || imgH <= 0)
+                    return
+
+                var labelW = worldImage.width
+                var labelH = worldImage.height
+
+                var scale = Math.min(labelW / imgW, labelH / imgH)
+                var displayW = imgW * scale
+                var displayH = imgH * scale
+                var offsetX = (labelW - displayW) / 2
+                var offsetY = (labelH - displayH) / 2
+
+                var x = (mouse.x - offsetX) / scale
+                var y = (mouse.y - offsetY) / scale
+
+                if (x < 0 || y < 0 || x > imgW || y > imgH)
+                    return
+
+                root.lastX = x
+                root.lastY = y
+            }}
+        }}
+    }}
+}}
+"""
+        # Write QML to a temp file
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".qml")
+        tmp.write(qml.encode("utf-8"))
+        tmp.flush()
+        tmp.close()
+        self._qml_file = tmp.name
+
+        self.quick_widget.setSource(QUrl.fromLocalFile(self._qml_file))
+        if self.quick_widget.status() != QQuickWidget.Status.Ready:
+            QMessageBox.critical(self, "QML Error", "Failed to load QML map.")
+            return False
+
+        return True
+
+    def _on_use_location(self):
+        root = self.quick_widget.rootObject()
+        if root is None:
+            QMessageBox.warning(self, "Map Error", "Map is not ready.")
+            return
+
+        x = root.property("lastX")
+        y = root.property("lastY")
+        img_w = root.property("imgWidth")
+        img_h = root.property("imgHeight")
+
+        try:
+            x = float(x)
+            y = float(y)
+            img_w = float(img_w)
+            img_h = float(img_h)
+        except (TypeError, ValueError):
+            QMessageBox.warning(self, "Location Error", "Could not read selected location.")
+            return
+
+        if x < 0 or y < 0:
+            QMessageBox.warning(self, "No Location Selected",
+                                "Please click on the map first.")
+            return
+
+        # Convert pixel (x, y) to lon/lat assuming equirectangular projection
+        lon = (x / img_w) * 360.0 - 180.0
+        lat = 90.0 - (y / img_h) * 180.0
+
         tzname = self.tf.timezone_at(lat=lat, lng=lon)
         if not tzname:
             QMessageBox.warning(self, "Time Zone Not Found",
                                 "Could not determine a time zone for that location.")
             return
+
         self.locationSelected.emit(lat, lon, tzname)
         self.accept()
 
-
+    def closeEvent(self, event):
+        if self._qml_file and os.path.exists(self._qml_file):
+            try:
+                os.remove(self._qml_file)
+            except Exception:
+                pass
+        super().closeEvent(event)
 class MapBridge(QObject):
     # Declare the signal as a class attribute
     mapClicked = pyqtSignal(float, float)
@@ -583,18 +672,12 @@ class MainWindow(QMainWindow):
     # ----- Map selection -----
 
     def open_map_for_column(self, column_widget):
-        try:
-            dlg = MapDialog(self)
-        except Exception as e:
-            QMessageBox.critical(self, "Map Error",
-                                 f"Could not open map: {e}")
+        dlg = QmlMapDialog(self)
+        if not dlg.is_valid():
             return
 
         def on_location_selected(lat, lon, tzname):
-            # We don't know a human-readable location name from lat/lon,
-            # so just use the time zone name as the "location" text.
             column_widget.set_timezone(tzname, tzname)
-            # Re-sync times
             if column_widget is self.col_left:
                 self._sync_from_left()
             else:
